@@ -72,7 +72,12 @@ buildings_msc <- res %>%
 st_bbox(buildings_msc)
 
 # st_write(buildings_msc, "data/buildings_msc.geojson")
-buildings_msc <- st_read("data/buildings_msc.geojson")
+buildings_msc <- st_read("../data/buildings_msc.geojson")
+
+# buildings_msc_5 <- sample_n(buildings_msc, 5)
+# st_write(buildings_msc_5, "data/buildings_msc_5.geojson")
+
+buildings_msc <- st_read("data/buildings_msc_5.geojson")
 
 #Data about organisations and pois from Moscow data store
 
@@ -171,10 +176,6 @@ sport <- st_read("data/sport.geojson") %>%
   st_transform(., 3857)
 
 #2. ISOCHRONES
-
-houses_points <- houses_points %>% 
-  dplyr::select(address,lat,lon,geom) %>%
-  rowid_to_column(., "sid")
 
 mb_token <- "pk.eyJ1IjoiYXNsdm92YSIsImEiOiJja2ptOGdvcjIwMWQ3MnZvOHEyM2x3bXQ3In0.BRbwaqHQSnuBwpFATRBDzQ"
 
@@ -343,7 +344,7 @@ joined <- joined_sport %>%
   st_transform(., 3857)
 
 st_write(joined, "data/results.geojson")
-# joined <- st_read("data/results.geojson")
+joined <- st_read("data/results.geojson")
 
 gathered <- as.data.frame(joined) %>%
   select(n_groceries, n_parks, n_schools, n_doctors, n_sports)
@@ -393,6 +394,8 @@ gghist <- ggplot(joined,
   ggtitle("How many types of facilities are accessible?") + 
   theme(plot.title = element_text(lineheight=.8, hjust = 0.5)) +
   labs(x = "number of categories", y = "total buildings")
+
+gghist
 
 NROW(subset(joined,n_total==5))
 NROW(subset(joined,n_total==5))/NROW(joined)

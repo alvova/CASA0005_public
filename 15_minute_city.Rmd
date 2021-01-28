@@ -1,28 +1,344 @@
 ---
-title: "15_minute_city"
+title: "15-minute City in Moscow"
+subtitle: "Measuring Pedestrian Accessibility to Everyday Services"
+author: "Anna Lvova"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
+<br>
+##Intro
 
-## R Markdown
+A 15-minute city is a concept gaining popularity around the globe that focuses of urban to sustainability. It has been already adopted as part of long-term strategies in Paris, Portland, Melbourne and others. A 15-minute city is one where everything people need including food, medicine, housing, jobs, education and entertainment is close to them.
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+This research aims to evaluate accessibility to everyday services for Moscow residents. We use open data about commercial and public amenities in Moscow and perform service area analysis. The goal of this analysis is to address spatial inequalities and sustainable development issues to the local policy makers.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+## Data collection and wrangling
 
-```{r cars}
-summary(cars)
+```{r libraries, results = 'hide', message=FALSE, warning = FALSE}
+library(sf)
+library(sp)
+library(readxl)
+library(tidyverse)
+library(tmap)
+library(tmaptools)
+library(rgdal)
+library(mapview)
+library(ggplot2)
+library(ggthemes)
+library(mapboxapi)
+library(spatstat)
+library(httr)
+library(pins)
+library(XML)
+library(methods)
+library(purrr)
+library(ggmap)
+library (reshape2)
+library(plotly)
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
+#### Amenities
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+First, we collect location data for 5 types of amenities in Moscow: 
+
+* grocery stores, 
+* parks, 
+* schools, 
+* public medical centers,
+* sport facilities. 
+
+Grocery stores data was additionally cleaned from non-food stores. Only chain stores were left as non-chain stores in Moscow are often of lower quality and stock. 
+
+Grocery stores data was additionally cleaned from non-food stores. Only chain stores were left as non-chain stores in Moscow are often of lower quality and stock. 
+
+```{r amenities, results = 'hide', message=FALSE, warning = FALSE}
+download.file("https://op.mos.ru/EHDWSREST/catalog/export/get?id=1034392",
+              destfile = "data/groceries.zip")
+unzip("data/groceries.zip", exdir="data")
+
+groceries_source <- read_excel("data/data-28509-2021-01-24.xlsx",
+                                na = "")
+
+groceries <- groceries_source %>%
+  dplyr::filter(TypeService == "реализация продовольственных товаров") %>%
+  dplyr::filter(TypeObject!="Магазин «Алкогольные напитки»") %>%
+  dplyr::filter(IsNetObject == "да") %>%
+  dplyr::select(ID, Name,Address,IsNetObject,TypeObject,geoData) %>%
+  rowwise() %>%
+  mutate(
+    coord = strsplit(geoData, "coordinates=[", fixed=TRUE)[[1]][2],
+    lon = strsplit(coord, ", ", fixed=TRUE)[[1]][1],
+    lat = strsplit(coord, ", ", fixed=TRUE)[[1]][2],
+    lat = strsplit(lat, "]}", fixed=TRUE)[[1]][1]
+    ) %>%
+  dplyr::select(ID, Name,Address,IsNetObject,TypeObject,lat,lon) %>%
+  st_as_sf(., coords = c("lon", "lat"),
+           crs = 4326) %>%
+  st_transform(., 3857)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Data about parks was cleaned and enriched with OSM data using QGIS. 
+
+School data represents a rating of top 399 institutions of high quality. Each school has several campuses, therefore there are 1337 location records.
+
+Data about medical centers is the smallest as it only represents public (free) medicine. There are numerous private medical centers, however we intentionally did not include them into the research as cities should aim at providing free accessible medicine if such exists.
+
+Data about sport venues is the largest because it was collected from OSM using Moscow’s bounding box. Therefore a lot of points are actually beyond reach. This dataset consists of both outdoor (e.g. football pitches) and indoor (e.g. gyms) venues. 
+
+``` {r amenities_2, results = 'hide', message=FALSE, warning = FALSE}
+doctors <- st_read("data/doctors.geojson") %>%
+  dplyr::select(global_id, ShortName,ObjectAddress, geometry) %>%
+  st_transform(., 3857)
+
+parks <- st_read('data/parks.geojson') %>%
+  st_transform(., 3857) %>%
+  select(name,geometry)
+
+schools <- read_tsv("data/schools.tsv") %>%
+  st_as_sf(., coords = c("lon", "lat"),
+           crs = 4326) %>%
+  st_transform(., 3857)
+
+sport <- st_read("data/sport.geojson") %>%
+  dplyr::select(name, leisure, sport, geometry) %>%
+  st_transform(., 3857)
+```
+
+#### Buildings
+Second, data on residential buildings in Moscow was collected from Russian housing data portal https://www.reformagkh.ru/.  The dataset contains information about every building’s address, built year and number of flats. The dataset was geocoded using Yandex Geocoder. 
+
+``` {r buildings, results = 'hide', message=FALSE, warning = FALSE}
+
+#a sample of resulting data
+buildings_msc <- st_read("data/buildings_msc_5.geojson")
+```
+
+#### Service areas
+
+Next, a service area was calculated for every building using in Moscow. Traditionally services area is calculated as a buffer zone of a certain radius using Euclidean distance. This method is popular due to its simplicity, however it includes areas inaccessible in real life due to the street network. This leads to overestimation of service areas (Gutiérrez and García-Palomares, 2008). To avoid it, network analysis is used to calculate distances similar to real pedestrian routes. 
+
+In this research service areas were calculated using Mapbox Isochrone API. 
+
+```{r isochrones, results = 'hide', message=FALSE, warning = FALSE}
+
+mb_token <- "pk.eyJ1IjoiYXNsdm92YSIsImEiOiJja2ptOGdvcjIwMWQ3MnZvOHEyM2x3bXQ3In0.BRbwaqHQSnuBwpFATRBDzQ"
+
+iso_15 <- mb_isochrone(buildings_msc, "walking", time = 15, id_column = "id", access_token = mb_token)
+
+```
+
+## Intersecting amenities and isochrones
+
+Each POI was spatially intersected with each isochrone. Then data was aggregated as a number of accessible amenities within buildings. For education, only unique schools were used to avoid summarising different campuses of the same school. 
+
+``` {r intersection, results = 'hide', message=FALSE, warning = FALSE}
+# 1
+
+iso_15 <- iso_15 %>% 
+  st_transform(., 3857)
+
+groceries_sa <- groceries %>%
+  st_join(., iso_15) %>%
+  na.omit() # omit POI that do not intersect with any service area
+
+groceries_count <- groceries_sa %>%
+  group_by(id) %>%
+  summarise(n=n())%>%
+  st_drop_geometry()
+
+joined_groceries <- groceries_count %>%
+  base::merge(.,buildings_msc, by.x="id", by.y="id", all.y = TRUE) %>%
+  mutate(n = coalesce(n, 0))
+
+# 2
+parks_sa <- parks %>%
+  st_join(., iso_15) %>%
+  na.omit() # omit POI that do not intersect with any service area
+
+parks_count <- parks_sa %>%
+  group_by(id) %>%
+  summarise(n=n()) %>%
+  st_drop_geometry()
+
+joined_parks <- parks_count %>%
+  base::merge(.,buildings_msc, by.x="id", by.y="id", all.y = TRUE) %>%
+  mutate(n = coalesce(n, 0))
+
+# 3
+schools_sa <- schools %>%
+  st_join(., iso_15) %>%
+  na.omit() # omit POI that do not intersect with any service area
+
+schools_count <- schools_sa %>%
+  group_by(id) %>%
+  summarise(Unique_Elements = n_distinct(rating)) %>%
+  dplyr::rename(n_schools = Unique_Elements) %>%
+  st_drop_geometry()
+
+joined_schools <- schools_count %>%
+  base::merge(.,buildings_msc, by.x="id", by.y="id", all.y = TRUE) %>%
+  mutate(n_schools = as.numeric(n_schools)) %>%
+  mutate(n_schools = coalesce(n_schools, 0))
+
+# 4
+doctors_sa <- doctors %>%
+  st_join(., iso_15) %>%
+  na.omit() # omit POI that do not intersect with any service area
+
+doctors_count <- doctors_sa %>%
+  group_by(id) %>%
+  summarise(n=n()) %>%
+  st_drop_geometry()
+
+joined_doctors <- doctors_count %>%
+  base::merge(.,buildings_msc, by.x="id", by.y="id", all.y = TRUE) %>%
+  mutate(n = coalesce(n, 0)) %>%
+  st_as_sf()
+
+# 5
+
+sport_sa <- sport %>%
+  st_join(., iso_15) %>%
+  na.omit() # omit POI that do not intersect with any service area
+
+sport_count <- sport_sa %>%
+  group_by(id) %>%
+  summarise(n=n())%>%
+  st_drop_geometry()
+
+joined_sport <- sport_count %>%
+  base::merge(.,buildings_msc, by.x="id", by.y="id", all.y = TRUE) %>%
+  mutate(n = coalesce(n, 0))
+
+#Merge all
+
+joined_groceries <- joined_groceries %>%
+  dplyr::select(id,n) %>%
+  dplyr::rename(n_groceries=n)
+
+joined_parks <- joined_parks %>%
+  dplyr::select(id,n) %>%
+  dplyr::rename(n_parks=n)
+
+joined_schools <- joined_schools %>%
+  dplyr::select(id,n_schools)
+
+joined_doctors <- joined_doctors %>%
+  dplyr::select(id,n) %>%
+  dplyr::rename(n_doctors=n)
+
+joined <- joined_sport %>%
+  dplyr::select(id,n, built_year, flats_count) %>%
+  dplyr::rename(n_sports=n) %>%
+  base::merge(.,joined_groceries, by.x="id", by.y="id") %>%
+  base::merge(.,joined_parks, by.x="id", by.y="id") %>%
+  base::merge(.,joined_schools, by.x="id", by.y="id") %>%
+  base::merge(.,joined_doctors, by.x="id", by.y="id") %>%
+  mutate(n1 = case_when(n_groceries > 0 ~ 1,
+                        TRUE ~0)) %>%
+  mutate(n2 = case_when(n_parks > 0 ~ 1,
+                        TRUE ~0)) %>%
+  mutate(n3 = case_when(n_schools > 0 ~ 1,
+                        TRUE ~0)) %>%
+  mutate(n4 = case_when(n_doctors > 0 ~ 1,
+                        TRUE ~0)) %>%
+  mutate(n5 = case_when(n_sports > 0 ~ 1,
+                        TRUE ~0)) %>%
+  mutate(n_total = n1 + n2 + n3 + n4 + n5) %>%
+  st_as_sf() %>%
+  st_transform(., 3857)
+
+# st_write(joined, "data/results.geojson")
+
+joined <- st_read("data/results.geojson")
+```
+
+Histograms were built to analyse the distribution of buildings with different amounts of services within 15 minute walk. They show that only groceries have a normal distribution with a lot of stores accessible to people. Other amenities’ distributions are positively skewed. 
+
+Sport is the least accessible type of infrastructure with almost third of houses (10,174 of 34,393) not having access to any facility at all. More than 6,600 buildings do not have access to any park. As both types of facilities proved to be essential during the lockdown these results pose serious health issues to the population. 
+
+``` {r facet histograms, echo=FALSE, fig.align='center'}
+gathered <- as.data.frame(joined) %>%
+  select(n_groceries, n_parks, n_schools, n_doctors, n_sports)
+  
+gathered %>% 
+  gather(cols, value) %>% 
+  ggplot(aes(x = value)) + 
+  geom_histogram(color="white", 
+                 fill="coral",
+                 bins=50,
+                 alpha = 0.7) + 
+  facet_wrap(~ cols, ncol = 3)
+```
+
+The next graph shows the sum of five categories. On the one, the distribution is negatively skewed with 5 out of 5 being the mode value (17208). On the other hand, it means that only 50% of houses in Moscow have access to all 5 types of facilities selected for this research. 
+
+``` {r histogram, echo=FALSE, fig.align='center', message=FALSE, warning = FALSE}}
+
+gghist <- ggplot(joined,
+                   aes(x=n_total)) +
+  geom_histogram(color="white",
+                 fill="coral",
+                 bins=20,
+                 alpha = 0.7)+
+  ggtitle("How many types of facilities are accessible?") + 
+  theme(plot.title = element_text(lineheight=.8, hjust = 0.5)) +
+  labs(x = "number of categories", y = "total buildings")
+
+gghist
+```
+
+Finally, we aggregate the sum of 5 categories by grid and mapped it. We used inverted palette to represent lowest accessibility with darker colour to attract more attention to them. 
+
+
+``` {r aggregating by grid, results = 'hide', message=FALSE, warning = FALSE}
+grid <-  st_read("data/grid.geojson") %>% 
+  mutate(grid_id = row_number()) %>% 
+  st_transform(., 3857)
+
+joined <- joined %>% 
+  st_transform(., 3857)
+
+output <- joined %>% 
+  st_join(grid,.) %>% 
+  group_by(grid_id) %>% 
+  summarize(mean_n = mean(n_total, na.rm = TRUE))
+```
+
+``` {r grid_map, echo=FALSE,  fig.align='center', message=FALSE, warning = FALSE}}
+
+tmap_mode("view")
+
+qtm(output)+
+  tm_shape(output)+
+  tm_fill(col="mean_n",
+              palette="viridis",
+              breaks = c(0,0.5, 1, 1.5, 2, 2.5, 3,3.5, 4, 4.5, Inf),
+              alpha=0.5,
+              legend.hist = TRUE,
+              title = "Types of services within 15 mins") + 
+  tm_scale_bar(width = 0.1, position = c("right", "bottom")) +
+  tm_borders(col = "black", lwd=0.1)+
+tm_layout(
+          frame=FALSE,
+          legend.hist.size = 0.5)+
+  tm_view(set.view = c(37.621190, 55.753856, 9))
+
+```
+
+The majority of the area have access to at least 4 of out 5 categories. However, it is crucial to pay attention to areas below that levels. It can observed, that there are certain areas with lower characteristics. They are primarily in the New Moscow, a large south-westward territory which was added to the city in 2012, but as the analysis shows still lacks proper social and commercial infrastructure.
+
+However, even some central area lack proper accessibility. Another concentration of darker cells can be observed in eastern parts of the city which have traditionally have lower housing prices. It means poorer Muscovites potentially have worse access to basic needs, thus economic inequality is supported by spatial one. 
+
+
+## Conclusion
+
+This study is set to analyse accessibility of daily services in Moscow using the 15-minute city approach. Five key POI categories were obtained from open data portals to investigate whether Moscow resident can reach to them within walkable distance. 
+
+Our results show that only half of the households have access to all 5 categories. Mapping the results shows that areas with lowest accessibility are situated in New Moscow and eastern part of the city, area with the lowest housing prices in the city. Thus financially poorer households experience poorer commercial and social conditions in the city. 
+
+We suggest implementing this study into Moscow policy making process to address the spatial inequality, increase pedestrian accessibility and to overall meet the global goals of sustainable development. 
